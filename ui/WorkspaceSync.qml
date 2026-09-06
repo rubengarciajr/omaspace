@@ -1,0 +1,1 @@
+../packaging/shell-sync/WorkspaceSync.qml

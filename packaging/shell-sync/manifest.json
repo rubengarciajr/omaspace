@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "id": "omaspace.workspace-sync",
+  "name": "OmaSpace Workspace Sync",
+  "version": "1.0.0",
+  "author": "OmaSpace",
+  "description": "Refreshes the shell workspace cache after native workspace moves and swaps.",
+  "kinds": ["service"],
+  "entryPoints": {"service": "WorkspaceSync.qml"}
+}

@@ -1,0 +1,7 @@
+singleton SystemStyle 1.0 SystemStyle.qml
+OLabel 1.0 OLabel.qml
+OButton 1.0 OButton.qml
+WindowPreview 1.0 WindowPreview.qml
+WorkspaceCard 1.0 WorkspaceCard.qml
+QuickSwitcher 1.0 QuickSwitcher.qml
+WorkspaceSync 1.0 WorkspaceSync.qml
