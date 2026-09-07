@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import omaspace.core as core
 h = core.Hypr()
 original_monitors = h.query('monitors')
+original_workspaces = h.query('workspaces')
 original_focus = h.query('activewindow').get('address')
 nonce = str(time.time_ns())
 app_id = 'org.omaspace.fixture.' + nonce
@@ -29,11 +30,11 @@ def wait_for(fn, timeout=7):
 
 
 def fixtures():
-    return [c for c in h.query('clients') if c['class'] == app_id]
+    return [c for c in h.query('clients') if c['class'] in (app_id, app_id + '.extra')]
 
 
-def launch(title, ws):
-    argv = ['foot', '--app-id=' + app_id, '--title=' + title, 'sh', '-c', 'printf "OmaSpace integration fixture\\n"; sleep 600']
+def launch(title, ws, extra=False):
+    argv = ['foot', '--app-id=' + app_id + ('.extra' if extra else ''), '--title=' + title, 'sh', '-c', 'printf "OmaSpace integration fixture\\n"; sleep 600']
     h.evaluate('hl.exec_cmd(' + core.lua(core.shlex.join(argv)) + ', {workspace=' + core.lua(str(ws) + ' silent') + '}); return "OMASPACE_OK"')
     return wait_for(lambda: next((c for c in fixtures() if c['title'] == title), None))
 
@@ -83,6 +84,7 @@ try:
         core.swap_windows(a['address'], b['address'], h)
         h.dispatch('window.close', {'window': 'address:' + d['address']})
         wait_for(lambda: len(fixtures()) == 3)
+        extra = launch('OmaSpace extra startup window', 4, extra=True)
         if '--ui' in sys.argv:
             root = Path(__file__).resolve().parents[1]
             subprocess.run(['qs', 'ipc', '-p', str(root / 'ui'), 'call', 'omaspace', 'close'], capture_output=True)
@@ -108,8 +110,13 @@ try:
         else:
             report = core.restore_session(h)
         print(json.dumps(report), flush=True)
-        check('restore relaunches a missing app', len(fixtures()) == 4 and not report['failed'])
-        check('restore does not duplicate already-open windows', len(fixtures()) == 4)
+        check('restore relaunches a missing app', len(fixtures()) == 5 and not report['failed'])
+        check('restore does not duplicate already-open windows', len(fixtures()) == 5)
+        check('extra startup window moved to unused workspace',
+              any(n['address'] == extra['address'] and n['workspace']['id'] not in
+                  {w['id'] for w in original_workspaces} | {4, 7} for n in fixtures()))
+        check('extra startup window reported', len(report['relocated']) == 1)
+        check('saved layout was not skipped', not report['layoutWarnings'])
         now = {n['title']: n for n in core.state(h)['clients'] if n['class'] == app_id}
         for n in s['clients']:
             check('restore workspace for ' + n['title'], now[n['title']]['workspace']['id'] == n['workspace']['id'])

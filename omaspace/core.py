@@ -401,22 +401,27 @@ def restore_session(h=None, pinned=False):
     active = next((c['address'] for c in initial if c.get('focusHistoryID') == 0), None)
     def identity(c):
         return c.get('initialClass') or c['class']
-    # Consume each existing window once; prefer title match for multiple windows.
-    for c in saved:
-        available = [n for n in initial if identity(n) == identity(c) and n['address'] not in used]
-        if available:
-            n = next((n for n in available if n['title'] == c['title']), available[0])
-            matched[c['address']] = n['address']
-            used.add(n['address'])
+    def match_existing(clients):
+        # Reserve every exact title before a fallback can steal another window's
+        # match (common with several terminals or browser windows).
+        for exact in (True, False):
+            for c in saved:
+                if c['address'] in matched:
+                    continue
+                available = [n for n in clients if identity(n) == identity(c)
+                             and n['address'] not in used
+                             and (not exact or n['title'] == c['title'])]
+                if available:
+                    n = available[0]
+                    matched[c['address']] = n['address']
+                    used.add(n['address'])
+    match_existing(initial)
     for c in saved:
         if c['address'] in matched:
             continue
         # A previous launch may have restored several windows (for example Chrome).
-        available = [n for n in h.query('clients') if identity(n) == identity(c) and n['address'] not in used]
-        if available:
-            n = next((n for n in available if n['title'] == c['title']), available[0])
-            matched[c['address']] = n['address']
-            used.add(n['address'])
+        match_existing(h.query('clients'))
+        if c['address'] in matched:
             continue
         launch = c.get('launcher')
         if not launch:
@@ -467,18 +472,39 @@ def restore_session(h=None, pinned=False):
             x, y, w, height = c['rect']
             h.dispatch('window.resize', {'window': 'address:' + address, 'x': max(80, round(w * mw)), 'y': max(60, round(height * mh)), 'relative': False})
             h.dispatch('window.move', {'window': 'address:' + address, 'x': m['x'] + max(0, round(x * mw)), 'y': m['y'] + max(0, round(y * mh)), 'relative': False})
-    layout_warnings = []
+    layout_warnings, relocated = [], []
+    occupied_ids = {w['id'] for w in s['workspaces']} | {w['id'] for w in h.query('workspaces')}
+    occupied_ids.update(int(r['workspaceString']) for r in h.query('workspacerules')
+                        if r.get('workspaceString', '').isdigit())
+    overflow = next(n for n in range(1, 2147483647) if n not in occupied_ids)
     for ws in s['workspaces']:
         group = [c for c in saved if c['workspace']['id'] == ws['id'] and c['address'] in matched]
         if not group:
             continue
         live_ws = next((w for w in h.query('workspaces') if w['id'] == ws['id']), {})
-        # Do not reshape workspaces containing windows outside the saved session.
-        extra = [c for c in h.query('clients') if c['workspace']['id'] == ws['id'] and c['address'] not in used]
+        # Floating/unmapped windows do not participate in the tiling tree.
+        extra = [c for c in h.query('clients') if c['workspace']['id'] == ws['id']
+                 and c['address'] not in used and c.get('mapped') and not c.get('floating')]
+        tiled = [c for c in group if not c.get('floating')]
+        if not tiled:
+            continue
+        if live_ws.get('tiledLayout') == 'dwindle' and split_tree(tiled):
+            for c in extra:
+                if c.get('pinned'):
+                    continue
+                entry = {'address': c['address'], 'class': c['class'],
+                         'from': ws['id'], 'to': overflow}
+                # Write recovery intent before changing the desktop.
+                atomic_json(STATE / 'restore-extra-windows.json',
+                            {'at': time.time(), 'windows': relocated + [entry]})
+                move_window(c['address'], str(overflow), h)
+                relocated.append(entry)
+            extra = [c for c in h.query('clients') if c['workspace']['id'] == ws['id']
+                     and c['address'] not in used and c.get('mapped') and not c.get('floating')]
         if live_ws.get('tiledLayout') == 'dwindle' and not extra:
             if not restore_layout(group, matched, h):
                 layout_warnings.append(f'Workspace {ws["id"]}: non-binary layout; kept compositor tiling')
-        elif len(group) > 1:
+        elif tiled:
             layout_warnings.append(f'Workspace {ws["id"]}: kept current layout (extra windows or another layout engine)')
     for c in saved:
         if c['address'] in matched and c.get('fullscreen'):
@@ -489,8 +515,13 @@ def restore_session(h=None, pinned=False):
     if active and any(c['address'] == active for c in h.query('clients')):
         h.dispatch('focus', {'window': 'address:' + active})
     result = {'message': f'Restored {len(matched)} of {len(saved)} windows.', 'failed': failed, 'skipped': skipped,
-              'layoutWarnings': layout_warnings, 'at': time.time()}
+              'layoutWarnings': layout_warnings, 'relocated': relocated, 'at': time.time()}
+    if relocated:
+        noun = 'window' if len(relocated) == 1 else 'windows'
+        result['message'] += f' Moved {len(relocated)} extra {noun} to workspace {overflow}.'
+    if layout_warnings:
+        result['message'] += ' Layout incomplete; automatic saving paused. Retry restore or save to accept this arrangement.'
     atomic_json(STATE / 'restore-report.json', result)
-    if not failed and not skipped:
+    if not failed and not skipped and not layout_warnings:
         (STATE / 'restore-incomplete.json').unlink(missing_ok=True)
     return result

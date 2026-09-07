@@ -84,7 +84,7 @@ The installer saves the current desktop. A user systemd service records a new ch
 
 At the next Hyprland login, `omaspace-start` supplies the compositor environment and starts the session service. It waits 25 seconds for normal Omarchy autostarts and monitor mapping, then restores once per compositor session. Turn this off with **Login [A]: restore on/off** in the sidebar.
 
-Restore matches existing windows first, launches missing applications through their installed desktop entries, waits for new windows, places them on their workspaces, reconstructs compatible **dwindle** split trees and proportions, and restores floating geometry and fullscreen state. Windows created by a previous app launch are reused as well. Workspaces containing additional windows are not rebuilt. If a restore is incomplete, checkpoints pause so the original session remains available; manually saving accepts the current desktop and resumes checkpoints.
+Restore matches existing windows first, launches missing applications through their installed desktop entries, waits for new windows, places them on their workspaces, reconstructs compatible **dwindle** split trees and proportions, and restores floating geometry and fullscreen state. Windows created by a previous app launch are reused as well. Extra tiled windows on restored workspaces move to an unused numbered workspace, which is reported in the result; floating extras stay in place. Exact title matches are reserved before matching other windows of the same app. If a restore is incomplete (including layout warnings), checkpoints pause so the original session remains available; manually saving accepts the current desktop and resumes checkpoints.
 
 Boundaries:
 

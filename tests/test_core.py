@@ -1,3 +1,4 @@
+import copy
 import json
 from pathlib import Path
 import tempfile
@@ -7,6 +8,60 @@ from unittest.mock import patch
 import omaspace.core as core
 
 class CoreTests(unittest.TestCase):
+    def restore_fixture(self, saved, live, layout='dwindle'):
+        class Fake:
+            def query(self, name):
+                return copy.deepcopy({'clients': live, 'monitors': [], 'workspacerules': [],
+                                      'workspaces': [{'id': 1, 'tiledLayout': layout}]}[name])
+            def dispatch(self, method, args):
+                if method == 'window.move' and 'workspace' in args:
+                    for c in live:
+                        if 'address:' + c['address'] == args['window']:
+                            c['workspace']['id'] = int(args['workspace'])
+        core.atomic_json(core.STATE / 'session.json',
+                         {'version': 1, 'savedAt': 1, 'clients': saved,
+                          'workspaces': [{'id': 1}]})
+        with patch.object(core, 'state', return_value={}):
+            return core.restore_session(Fake())
+
+    def client(self, address, title, cls='foot'):
+        return {'address': address, 'class': cls, 'title': title, 'workspace': {'id': 1, 'name': '1'},
+                'mapped': True, 'floating': False, 'rect': [0, 0, 1, 1]}
+
+    def test_layout_warning_protects_saved_session(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(core, 'STATE', Path(tmp)):
+            result = self.restore_fixture([self.client('a', 'A')], [self.client('b', 'A')], 'master')
+            self.assertTrue(result['layoutWarnings'])
+            self.assertTrue((Path(tmp) / 'restore-incomplete.json').exists())
+            self.assertIn('automatic saving paused', result['message'])
+
+    def test_exact_titles_reserved_before_fallback_matching(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(core, 'STATE', Path(tmp)), \
+                patch.object(core, 'restore_layout', return_value=True) as rebuild:
+            self.restore_fixture([self.client('a', 'old'), self.client('b', 'B')],
+                                 [self.client('x', 'B'), self.client('y', 'new')])
+            self.assertEqual(rebuild.call_args.args[1], {'b': 'x', 'a': 'y'})
+
+    def test_extra_tiled_window_relocated_before_rebuild(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(core, 'STATE', Path(tmp)), \
+                patch.object(core, 'restore_layout', return_value=True):
+            live = [self.client('x', 'A'), self.client('y', 'Extra', 'other-app')]
+            result = self.restore_fixture([self.client('a', 'A')], live)
+            self.assertEqual(live[1]['workspace']['id'], 2)
+            self.assertEqual(result['relocated'][0]['address'], 'y')
+            self.assertFalse(result['layoutWarnings'])
+            self.assertFalse((Path(tmp) / 'restore-incomplete.json').exists())
+
+    def test_extra_floating_window_does_not_block_rebuild(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(core, 'STATE', Path(tmp)), \
+                patch.object(core, 'restore_layout', return_value=True) as rebuild:
+            extra = self.client('y', 'Extra', 'other-app')
+            extra['floating'] = True
+            result = self.restore_fixture([self.client('a', 'A')], [self.client('x', 'A'), extra])
+            rebuild.assert_called_once()
+            self.assertEqual(result['relocated'], [])
+            self.assertEqual(extra['workspace']['id'], 1)
+
     def test_lua_injection_and_unicode_are_data(self):
         value = 'hello"; os.execute("bad") --\n\\文'
         encoded = core.lua(value)
