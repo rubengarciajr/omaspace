@@ -8,17 +8,20 @@ from unittest.mock import patch
 import omaspace.core as core
 
 class CoreTests(unittest.TestCase):
+    monitors = [{'id': 0, 'name': 'eDP-1', 'activeWorkspace': {'id': 1}}]
+
     def restore_fixture(self, saved, live, layout='dwindle'):
+        monitors = self.monitors
         class Fake:
             def query(self, name):
-                return copy.deepcopy({'clients': live, 'monitors': [], 'workspacerules': [],
+                return copy.deepcopy({'clients': live, 'monitors': monitors, 'workspacerules': [],
                                       'workspaces': [{'id': 1, 'tiledLayout': layout}]}[name])
             def dispatch(self, method, args):
                 if method == 'window.move' and 'workspace' in args:
                     for c in live:
                         if 'address:' + c['address'] == args['window']:
                             c['workspace']['id'] = int(args['workspace'])
-        core.atomic_json(core.STATE / 'session.json',
+        core.atomic_json(core.profile_directory(monitors) / 'session.json',
                          {'version': 1, 'savedAt': 1, 'clients': saved,
                           'workspaces': [{'id': 1}]})
         with patch.object(core, 'state', return_value={}):
@@ -32,7 +35,7 @@ class CoreTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, patch.object(core, 'STATE', Path(tmp)):
             result = self.restore_fixture([self.client('a', 'A')], [self.client('b', 'A')], 'master')
             self.assertTrue(result['layoutWarnings'])
-            self.assertTrue((Path(tmp) / 'restore-incomplete.json').exists())
+            self.assertTrue((core.profile_directory(self.monitors) / 'restore-incomplete.json').exists())
             self.assertIn('automatic saving paused', result['message'])
 
     def test_exact_titles_reserved_before_fallback_matching(self):
@@ -50,7 +53,7 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(live[1]['workspace']['id'], 2)
             self.assertEqual(result['relocated'][0]['address'], 'y')
             self.assertFalse(result['layoutWarnings'])
-            self.assertFalse((Path(tmp) / 'restore-incomplete.json').exists())
+            self.assertFalse((core.profile_directory(self.monitors) / 'restore-incomplete.json').exists())
 
     def test_extra_floating_window_does_not_block_rebuild(self):
         with tempfile.TemporaryDirectory() as tmp, patch.object(core, 'STATE', Path(tmp)), \

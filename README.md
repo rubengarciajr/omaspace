@@ -22,7 +22,7 @@ The installer replaces Super+Up's default “Focus on above window” shortcut a
 
 ## Your desktop
 
-The overview reads live monitors, clients, workspaces, and persistent workspace rules. Its initial layout was built for laptop workspaces **1–5** and external-monitor workspaces **6–10** (the **0** key is 10), with additional workspaces and the scratchpad available too. Configured empty workspaces remain visible, including those assigned to disconnected displays. Display resolution, scale, and workspace assignments are read from your existing setup.
+The overview detects available displays and reads their live workspace assignments. On the laptop alone, its main grid shows **1–5**. Connecting the external monitor adds its configured **6–10** workspaces (the **0** key is 10). An active iPad stream adds the workspaces assigned to that output. Empty workspaces belonging to unavailable displays are hidden in both the switcher and Settings. Scratchpad and occupied extra workspaces stay accessible under **Other open**, so windows are never lost from the overview. Display resolution and scale follow your existing configuration.
 
 Appearance uses the installed Omarchy shell's shared `Color` and `Style` components directly:
 
@@ -35,7 +35,7 @@ These values refresh on opening and every two seconds while idle and visible; th
 
 ## Two screens
 
-**Super+Up opens the compact switcher.** It has workspace previews, Switch, and Move. Displays have separate rows; extra workspaces stay available as small buttons.
+**Super+Up opens the compact switcher.** It has workspace previews, Switch, and Move. Available displays have separate rows; scratchpad and occupied extra workspaces stay available as small buttons.
 
 | Switcher key | Action |
 | --- | --- |
@@ -65,12 +65,12 @@ After a whole-workspace move, the selected card follows the destination. Older l
 | W | Move whole workspace; choose destination, then Enter |
 | X | Swap selected window's position with another tiled window |
 | Ctrl + Z | Undo the last move / swap in this app instance |
-| S | Save session and pin a manual checkpoint |
-| R | Review and restore the latest saved session; P in this dialog restores the manual checkpoint |
+| S | Save the current display profile and pin its manual checkpoint |
+| R | Restore the current display profile; P in this dialog restores its manual checkpoint |
 | A | Toggle automatic restore at login |
 | Escape | Cancel dialog, return to workspace view, then close |
 
-Mouse selection, double-click activation, and all visible buttons work too. The destination grid includes workspace 11 and any other numbered workspace; use arrows to reach numbers above 10.
+Mouse selection, double-click activation, and all visible buttons work too. The destination grid follows available displays and occupied extra workspaces. Number keys cannot select hidden destinations; use arrows for numbers above 10.
 
 **Example — move workspace 1 to 6:** Super+Up → 1 → M → 6 → Enter. If 6 is occupied, the two workspaces exchange places. Each whole layout moves to the destination display. Nothing is merged or closed. The dialog states this before applying; Ctrl+Z reverses the exchange.
 
@@ -80,9 +80,15 @@ Super+Up previously ran Omarchy's “Focus on above window” binding; OmaSpace 
 
 ## Remembering a session
 
-The installer saves the current desktop. A user systemd service records a new checkpoint after the desktop arrangement has stayed stable for 15 seconds. It retains 20 historical snapshots and never replaces a saved session with an empty desktop. **S** also preserves a separate manual checkpoint, accessible from the restore dialog.
+**Each display combination has its own profile.** Laptop, laptop + external monitor, laptop + iPad, and all three displays keep independent layouts, manual checkpoints, histories, and restore reports. The detected profile appears in the switcher and Settings. Press **S / Save profile** to remember the current setup, or **R / Restore** to restore it. Profiles are keyed by sorted output names, so changes to numeric monitor IDs, enumeration order, resolution, or scale do not select a different profile.
 
-At the next Hyprland login, `omaspace-start` supplies the compositor environment and starts the session service. It waits 25 seconds for normal Omarchy autostarts and monitor mapping, then restores once per compositor session. Turn this off with **Login [A]: restore on/off** in the sidebar.
+The installer saves the current setup if it has no profile yet. A user systemd service saves window size, floating, and fullscreen changes after they have stayed stable for two seconds (typically within 2–4 seconds including polling). App launches, closures, and workspace moves keep a 15-second settling period. It retains 20 historical snapshots per profile and never replaces a save with an empty desktop. **S** saves immediately and preserves a separate manual checkpoint for the current profile. **Restore latest / R** uses the latest saved positions and sizes; **P** deliberately restores the older manual checkpoint. Settings shows the latest save time and the restore dialog dates both versions.
+
+Connecting or disconnecting a display selects its matching profile. After the connection has settled for five seconds, **Auto-switch: on** restores that profile if one exists. Turn this off in Settings to select profiles while keeping windows where they are. New setups begin with the current arrangement and get their own checkpoints. A save or restore interrupted by a display change cannot overwrite another profile. Laptop saves include windows on available displays; windows left on an unavailable virtual display remain accessible in Other open.
+
+At login, the service waits 25 seconds for normal autostarts and monitor mapping, then restores only the matching profile. **Login [A]** controls login restore independently of Auto-switch. Existing legacy saves and manual checkpoints are copied into profiles for their recorded display combinations, with the original files retained.
+
+The virtual **iPad** output is considered available only while Sunshine reports a connected client in its current service invocation. An idle headless output alone does not add workspaces. Detection supports `app-dev.lizardbyte.app.Sunshine.service` and `sunshine.service` in the user session. For a different virtual-display setup, configure `~/.config/omaspace/displays.json`, for example `{"virtual": {"iPad": "sunshine"}}`. Virtual entries can use `sunshine`, `on` (count whenever Hyprland exposes it), or `off` (exclude it). Physical outputs are detected directly through Hyprland.
 
 Restore matches existing windows first, launches missing applications through their installed desktop entries, waits for new windows, places them on their workspaces, reconstructs compatible **dwindle** split trees and proportions, and restores floating geometry and fullscreen state. Windows created by a previous app launch are reused as well. Extra tiled windows on restored workspaces move to an unused numbered workspace, which is reported in the result; floating extras stay in place. Exact title matches are reserved before matching other windows of the same app. If a restore is incomplete (including layout warnings), checkpoints pause so the original session remains available; manually saving accepts the current desktop and resumes checkpoints.
 
@@ -92,7 +98,7 @@ Boundaries:
 - Exact native tiling recovery supports binary dwindle layouts. Other tiling engines and overlapping/tabbed layouts keep compositor tiling and report the limitation. App minimum sizes may constrain geometry.
 - Scratchpads are visible and individual windows can be moved from them. Omarchy's preloader owns scratchpad startup, so OmaSpace does not relaunch scratchpad windows.
 - Pinned windows must be unpinned before moving; swapping positions requires tiled windows.
-- A missing monitor falls back to the available layout. Reconnecting displays follows your existing Omarchy monitor rules.
+- A different display combination selects a separate profile. It does not restore the layout saved for missing displays. Workspace assignments still follow your existing Omarchy monitor rules.
 - Relaunch requires a matching installed desktop entry. Failed/missing launchers are reported. Multi-window singleton applications may choose to open fewer windows than requested.
 - Tested restore using real temporary windows, including reopening a closed application and matching saved geometry. A physical reboot has **not** been performed.
 
@@ -125,11 +131,12 @@ omaspace restore-pinned
 omaspace move-window 0xADDRESS 6
 omaspace move-workspace 1 6
 omaspace settings autoRestore false
+omaspace settings autoProfileRestore false
 systemctl --user status omaspace-session.service
 journalctl --user -u omaspace-session.service
 ```
 
-The installer links `~/.local/bin/omaspace` to this checkout. New XDG config/state directories link to `.local/config` and `.local/state` here; existing OmaOrder data is reused when present. State files are mode 0600 inside mode 0700 directories. They contain private window titles and application paths, and are gitignored. Live configuration backups are in `.backups/`, also gitignored. Keep this checkout in place while the app is installed.
+The installer links `~/.local/bin/omaspace` to this checkout. New XDG config/state directories link to `.local/config` and `.local/state` here; existing OmaOrder data is reused when present. Profiles live in `~/.local/state/omaspace/profiles/<profile-id>/`, each with `session.json`, `pinned-session.json`, and `history/`. State files are mode 0600 inside mode 0700 directories. They contain private window titles and application paths, and are gitignored. Live configuration backups are in `.backups/`, also gitignored. Keep this checkout in place while the app is installed.
 
 Uninstall integration while retaining snapshots and source:
 
@@ -146,7 +153,7 @@ python scripts/check-return-move.py
 python scripts/check-return-move.py --occupied
 ```
 
-The integration check requires **empty workspaces 4 and 7**, creates uniquely identified temporary Foot windows, checks moves and swaps across monitors, reopens a missing window, and compares restored geometry. It closes only its own fixtures and restores the original view. Stop the session service before running it and start it afterward so fixtures do not enter checkpoints.
+The integration check requires **empty workspaces 4 and 7** with an external display, or **4 and 5** on the laptop alone, creates uniquely identified temporary Foot windows, checks moves and swaps (across monitors when available), reopens a missing window, compares resized tiled and floating geometry, and verifies prompt background resize saving in an isolated profile. It closes only its own fixtures and restores the original view. Stop the session service before running it and start it afterward so fixtures do not enter checkpoints.
 
 Implementation references: [Hyprland Lua dispatchers](https://wiki.hypr.land/Configuring/Basics/Dispatchers/), [Dwindle layout](https://wiki.hypr.land/Configuring/Layouts/Dwindle-Layout/), [Quickshell screencopy](https://master.quickshell.org/docs/types/Quickshell.Wayland/ScreencopyView). The installed Lua API and Hyprland v0.56.2 source were also checked for version-specific behavior.
 

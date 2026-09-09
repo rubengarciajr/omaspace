@@ -96,9 +96,13 @@ subprocess.run(['systemctl', '--user', 'import-environment', 'HYPRLAND_INSTANCE_
 # Mark this session already initialized: installing never relaunches the current desktop.
 import sys
 sys.path.insert(0, str(ROOT))
-from omaspace.core import atomic_json, save_session
+from omaspace.core import (atomic_json, save_session, migrate_profiles, profile_directory,
+                           connected_monitors, Hypr, lock)
 atomic_json(STATE / 'omaspace/login.json', {'signature': os.environ.get('HYPRLAND_INSTANCE_SIGNATURE', '')})
-if not (STATE / 'omaspace/session.json').exists():
-    print(save_session()['message'])
+with lock():
+    migrate_profiles()
+    monitors = connected_monitors(Hypr().query('monitors'))
+    if monitors and not (profile_directory(monitors) / 'session.json').exists():
+        print(save_session()['message'])
 subprocess.run(['systemctl', '--user', 'start', 'omaspace-session.service'], check=True)
 print('Installed. Press Super+Up to open OmaSpace. Backups:', BACKUP)

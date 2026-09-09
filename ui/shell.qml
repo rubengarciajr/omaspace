@@ -32,15 +32,35 @@ ShellRoot {
     property int workspaceSource: 1
     property int swapTarget: 0
     property var displayScreen: null
-    readonly property var selectedWorkspace: data.workspaces.find(w => w.id === selectedId) || {id: selectedId, label: String(selectedId), name: String(selectedId), selector: String(selectedId), clients: [], monitor: ''}
+    readonly property var allWorkspaces: data.workspaces.concat(data.auxiliaryWorkspaces || [])
+    readonly property var selectedWorkspace: allWorkspaces.find(w => w.id === selectedId) || {id: selectedId, label: String(selectedId), name: String(selectedId), selector: String(selectedId), clients: [], monitor: ''}
+    readonly property string profileName: data.profile ? data.profile.name : 'Detecting displays…'
     readonly property var windows: selectedWorkspace.clients
     readonly property var selectedWindow: windows[Math.min(windowIndex, windows.length - 1)] || null
     readonly property var shownWorkspaces: data.workspaces.filter(w => !monitorFilter || w.monitor === monitorFilter)
-    readonly property var destinations: data.workspaces.filter(w => w.id > 0)
+    readonly property var destinations: allWorkspaces.filter(w => w.id > 0 && w.connected)
     property bool pendingAction: false
     readonly property bool busy: action.running || pendingAction || opening
     readonly property bool restoring: busy && action.command.length > 1 && action.command[1].startsWith('restore')
     readonly property string executable: Quickshell.shellDir + '/../bin-omaspace'
+
+    function acceptState(result, initial) {
+        const changed = data.profile && result.profile && data.profile.id !== result.profile.id
+        data = result
+        if (changed) {
+            quickSource = 0; dialog = ''; undoAction = []; monitorFilter = ''
+            status = 'Detected ' + profileName + (result.savedAt ? ' · Saved profile available.' : ' · Save this setup to remember it.')
+        }
+        const monitor = result.monitors.find(m => m.focused) || result.monitors[0]
+        if (initial || !allWorkspaces.some(w => w.id === selectedId)) {
+            const focused = monitor ? monitor.activeWorkspace.id : 0
+            selectedId = allWorkspaces.some(w => w.id === focused) ? focused : (result.workspaces[0] ? result.workspaces[0].id : 0)
+            windowIndex = 0
+        }
+        if (monitorFilter && !result.monitors.some(m => m.name === monitorFilter)) monitorFilter = ''
+        if (monitor && (initial || changed)) displayScreen = Quickshell.screens.find(s => s.name === monitor.name) || displayScreen
+        if (!destinations.some(w => w.id === destination)) destination = destinations.length ? destinations[0].id : 0
+    }
 
     function refresh() {
         SystemStyle.refresh()
@@ -88,7 +108,7 @@ ShellRoot {
         else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) quickActivate()
         else if (event.key >= Qt.Key_0 && event.key <= Qt.Key_9) selectWorkspace(event.key === Qt.Key_0 ? 10 : event.key - Qt.Key_0)
         else {
-            const list = data.workspaces.filter(w => !quickSource || w.id > 0)
+            const list = allWorkspaces.filter(w => !quickSource || (w.id > 0 && w.connected))
             let step = 0
             if ([Qt.Key_Left, Qt.Key_H, Qt.Key_Backtab].includes(event.key)) step = -1
             else if ([Qt.Key_Right, Qt.Key_L, Qt.Key_Tab].includes(event.key)) step = 1
@@ -100,6 +120,7 @@ ShellRoot {
     }
     function execute(args) {
         if (busy) return
+        if (['save', 'restore', 'restore-pinned'].includes(args[0]) && data.profile) args = args.concat([data.profile.id])
         // A snapshot started before a move must not repaint the old layout.
         openRevision++
         action.command = [executable].concat(args)
@@ -122,6 +143,7 @@ ShellRoot {
     onSelectedIdChanged: Qt.callLater(revealSelection)
     onWindowIndexChanged: Qt.callLater(revealSelection)
     function selectWorkspace(id) {
+        if (!allWorkspaces.some(w => w.id === id)) return
         if (monitorFilter && !shownWorkspaces.some(w => w.id === id)) monitorFilter = ''
         selectedId = id; windowIndex = 0
     }
@@ -136,7 +158,8 @@ ShellRoot {
         if (kind === 'workspace' && selectedId <= 0) { status = 'Scratchpads can move individual windows; whole moves use numbered workspaces.'; return }
         actionSource = selectedWindow ? selectedWindow.address : ''
         workspaceSource = selectedId
-        destination = selectedId === 1 ? 6 : 1
+        const next = destinations.find(w => w.id !== selectedId)
+        destination = next ? next.id : selectedId
         dialog = kind
     }
     function beginSwap() {
@@ -147,6 +170,7 @@ ShellRoot {
     }
     function acceptDialog() {
         const current = dialog
+        if ((current === 'window' || current === 'workspace') && !destinations.some(w => w.id === destination)) return
         if (current === 'window') execute(['move-window', actionSource, String(destination)])
         else if (current === 'workspace') execute(['move-workspace', String(workspaceSource), String(destination)])
         else if (current === 'swap' && windows[swapTarget]) execute(['swap-windows', actionSource, windows[swapTarget].address])
@@ -168,11 +192,13 @@ ShellRoot {
         } else if ((event.modifiers & Qt.MetaModifier) && event.key === Qt.Key_Up) close()
         else if (event.key === Qt.Key_Z && (event.modifiers & Qt.ControlModifier)) { if (undoAction.length) { execute(undoAction); undoAction = [] } }
         else if (dialog) {
-            if (dialog === 'restore' && event.key === Qt.Key_P) { execute(['restore-pinned']); dialog = '' }
+            if (dialog === 'restore' && event.key === Qt.Key_P && data.pinnedAt) { execute(['restore-pinned']); dialog = '' }
             else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) acceptDialog()
             else if (dialog === 'window' || dialog === 'workspace') {
-                if (event.key >= Qt.Key_0 && event.key <= Qt.Key_9) destination = event.key === Qt.Key_0 ? 10 : event.key - Qt.Key_0
-                else if ([Qt.Key_Left, Qt.Key_Right, Qt.Key_Up, Qt.Key_Down].includes(event.key)) {
+                if (event.key >= Qt.Key_0 && event.key <= Qt.Key_9) {
+                    const number = event.key === Qt.Key_0 ? 10 : event.key - Qt.Key_0
+                    if (destinations.some(w => w.id === number)) destination = number
+                } else if (destinations.length && [Qt.Key_Left, Qt.Key_Right, Qt.Key_Up, Qt.Key_Down].includes(event.key)) {
                     let i = destinations.findIndex(w => w.id === destination)
                     let step = event.key === Qt.Key_Left ? -1 : event.key === Qt.Key_Right ? 1 : event.key === Qt.Key_Up ? -5 : 5
                     destination = destinations[Math.max(0, Math.min(destinations.length - 1, i + step))].id
@@ -215,7 +241,7 @@ ShellRoot {
         function open(): void { app.open() }
         function close(): void { app.close() }
         function style(): string { return JSON.stringify({border: SystemStyle.borderWidth, radius: SystemStyle.cornerRadius, font: SystemStyle.fontFamily, body: SystemStyle.font.body, heading: SystemStyle.font.heading, spacingScale: SystemStyle.spacing.scale}) }
-        function inspect(): string { return JSON.stringify({opened: app.opened, selected: app.selectedId, screen: app.screenMode, carrying: app.quickSource, view: app.view, dialog: app.dialog, workspaces: app.data.workspaces.length, windows: app.windows.length, busy: app.busy, opening: app.opening, panelVisible: switcher.visible || panel.visible, status: app.status}) }
+        function inspect(): string { return JSON.stringify({opened: app.opened, selected: app.selectedId, screen: app.screenMode, carrying: app.quickSource, view: app.view, dialog: app.dialog, workspaces: app.data.workspaces.length, workspaceIds: app.data.workspaces.map(w => w.id), auxiliaryIds: (app.data.auxiliaryWorkspaces || []).map(w => w.id), profile: app.data.profile, destination: app.destination, windows: app.windows.length, busy: app.busy, opening: app.opening, panelVisible: switcher.visible || panel.visible, status: app.status}) }
     }
     Process {
         id: initialFetch
@@ -229,9 +255,7 @@ ShellRoot {
                     if (result.error) throw new Error(result.error)
                     const monitor = result.monitors.find(m => m.focused) || result.monitors[0]
                     if (!monitor) throw new Error('No active display')
-                    app.data = result
-                    app.selectedId = monitor.activeWorkspace.id
-                    app.displayScreen = Quickshell.screens.find(s => s.name === monitor.name) || app.displayScreen
+                    app.acceptState(result, true)
                     app.opening = false
                     const queued = app.queuedKeys
                     app.queuedKeys = []
@@ -258,7 +282,7 @@ ShellRoot {
                 try {
                     const result = JSON.parse(text)
                     if (result.error) { app.status = result.error; app.statusError = true }
-                    else if (JSON.stringify(app.data) !== JSON.stringify(result)) app.data = result
+                    else if (JSON.stringify(app.data) !== JSON.stringify(result)) app.acceptState(result, false)
                 } catch (e) { app.status = 'Could not read the desktop: ' + e; app.statusError = true }
             }
         }
@@ -327,11 +351,11 @@ ShellRoot {
                         ColumnLayout {
                             spacing: SystemStyle.space(3)
                             OLabel { palette: app.palette; text: 'OmaSpace'; font.pixelSize: SystemStyle.font.display }
-                            OLabel { palette: app.palette; text: 'Window management & session settings'; font.pixelSize: SystemStyle.font.bodySmall; opacity: .5 }
+                            OLabel { palette: app.palette; text: 'Display profile · ' + app.profileName; font.pixelSize: SystemStyle.font.bodySmall; opacity: .5 }
                         }
                         Item { Layout.fillWidth: true }
                         OLabel { palette: app.palette; text: app.data.clients.length + ' windows   /   ' + app.data.workspaces.length + ' workspaces'; font.pixelSize: SystemStyle.font.bodySmall; opacity: .5 }
-                        OButton { palette: app.palette; text: 'Save session  S'; enabled: !app.busy; onClicked: app.execute(['save']) }
+                        OButton { palette: app.palette; text: 'Save profile  S'; enabled: !app.busy; onClicked: app.execute(['save']) }
                         OButton { palette: app.palette; text: 'Restore  R'; enabled: !app.busy; onClicked: app.dialog = 'restore' }
                         OButton { palette: app.palette; text: '← Switcher'; onClicked: { app.screenMode = 'switcher'; app.view = 'workspaces'; app.dialog = '' } }
                     }
@@ -353,6 +377,16 @@ ShellRoot {
                                     onClicked: { app.monitorFilter = modelData.name; app.view = 'workspaces'; const ws = app.shownWorkspaces[0]; if (ws) app.selectWorkspace(ws.id) }
                                 }
                             }
+                            OLabel { palette: app.palette; text: 'OTHER OPEN'; visible: (app.data.auxiliaryWorkspaces || []).length > 0; font.pixelSize: SystemStyle.font.caption; opacity: .5 }
+                            Repeater {
+                                model: app.data.auxiliaryWorkspaces || []
+                                OButton {
+                                    required property var modelData
+                                    palette: app.palette; text: modelData.label + (modelData.id > 0 ? ' · ' + modelData.clients.length + (modelData.clients.length === 1 ? ' window' : ' windows') : '')
+                                    checked: app.selectedId === modelData.id; Layout.fillWidth: true
+                                    onClicked: { app.selectWorkspace(modelData.id); app.view = 'windows' }
+                                }
+                            }
                             Item { Layout.preferredHeight: SystemStyle.space(20) }
                             OLabel { palette: app.palette; text: 'SELECTED WORKSPACE'; font.pixelSize: SystemStyle.font.caption; opacity: .4 }
                             OLabel { palette: app.palette; text: app.selectedWorkspace.id > 0 ? 'Workspace ' + app.selectedWorkspace.label : app.selectedWorkspace.label; font.pixelSize: SystemStyle.font.heading; color: app.palette.accent; Layout.fillWidth: true }
@@ -361,13 +395,18 @@ ShellRoot {
                             OButton { palette: app.palette; text: 'Move workspace  W'; enabled: !app.busy && app.selectedId > 0; Layout.fillWidth: true; onClicked: app.beginMove('workspace') }
                             Item { Layout.fillHeight: true }
                             Rectangle {
-                                Layout.fillWidth: true; implicitHeight: SystemStyle.space(136); radius: SystemStyle.cornerRadius; color: Qt.alpha(app.palette.foreground, .035)
+                                Layout.fillWidth: true; implicitHeight: profileColumn.implicitHeight + SystemStyle.space(28); radius: SystemStyle.cornerRadius; color: Qt.alpha(app.palette.foreground, .035)
                                 ColumnLayout {
+                                    id: profileColumn
                                     anchors { fill: parent; margins: SystemStyle.space(14) } spacing: SystemStyle.space(8)
-                                    OLabel { palette: app.palette; text: 'SESSION MEMORY'; font.pixelSize: SystemStyle.font.caption; opacity: .5 }
-                                    OLabel { palette: app.palette; text: app.data.savedAt ? app.data.savedCount + ' windows saved' : 'No session saved yet'; font.pixelSize: SystemStyle.font.body }
-                                    OLabel { palette: app.palette; text: app.data.savedAt ? new Date(app.data.savedAt * 1000).toLocaleTimeString(Qt.locale(), 'h:mm AP') : 'Press S to remember'; font.pixelSize: SystemStyle.font.caption; opacity: .5 }
-                                    OButton { palette: app.palette; text: 'Login [A]: ' + (app.data.autoRestore ? 'restore on' : 'restore off'); Layout.fillWidth: true; implicitHeight: SystemStyle.space(29); onClicked: app.execute(['settings', 'autoRestore', app.data.autoRestore ? 'false' : 'true']) }
+                                    OLabel { palette: app.palette; text: 'DISPLAY PROFILE'; font.pixelSize: SystemStyle.font.caption; opacity: .5 }
+                                    OLabel { palette: app.palette; text: app.profileName; wrapMode: Text.Wrap; Layout.fillWidth: true }
+                                    OLabel { palette: app.palette; text: app.data.savedAt ? app.data.savedCount + ' windows saved' : 'Not saved yet'; font.pixelSize: SystemStyle.font.body }
+                                    OLabel { palette: app.palette; text: app.data.savePaused ? 'Autosave paused · retry restore or save' : (app.data.savedAt ? 'Saved ' + new Date(app.data.savedAt * 1000).toLocaleTimeString(Qt.locale(), 'h:mm:ss AP') : 'Save S · Restore R'); wrapMode: Text.Wrap; Layout.fillWidth: true; font.pixelSize: SystemStyle.font.caption; opacity: .5 }
+                                    OButton { palette: app.palette; text: 'Login [A]: ' + (app.data.autoRestore ? 'on' : 'off'); Layout.fillWidth: true; implicitHeight: SystemStyle.space(29); onClicked: app.execute(['settings', 'autoRestore', app.data.autoRestore ? 'false' : 'true']) }
+                                    OButton { palette: app.palette; text: 'Auto-switch: ' + (app.data.autoProfileRestore ? 'on' : 'off'); Layout.fillWidth: true; implicitHeight: SystemStyle.space(29); onClicked: app.execute(['settings', 'autoProfileRestore', app.data.autoProfileRestore ? 'false' : 'true']) }
+                                    OLabel { palette: app.palette; text: 'Saved setups: ' + (app.data.profiles || []).map(p => p.name).join(' · '); visible: (app.data.profiles || []).length > 0; wrapMode: Text.Wrap; Layout.fillWidth: true; font.pixelSize: SystemStyle.font.caption; opacity: .55 }
+
                                 }
                             }
                         }
@@ -429,7 +468,7 @@ ShellRoot {
                             }
                             RowLayout {
                                 Layout.fillWidth: true
-                                OLabel { palette: app.palette; text: app.view === 'windows' && app.selectedWindow ? app.selectedWindow.title : '1–5  Laptop     6–0  ThinkVision'; font.pixelSize: SystemStyle.font.bodySmall; opacity: .6; Layout.fillWidth: true }
+                                OLabel { palette: app.palette; text: app.view === 'windows' && app.selectedWindow ? app.selectedWindow.title : app.profileName + ' · Workspaces ' + app.data.workspaces.map(w => w.label).join(', '); font.pixelSize: SystemStyle.font.bodySmall; opacity: .6; Layout.fillWidth: true }
                                 OButton { palette: app.palette; text: 'Swap position  X'; visible: app.view === 'windows'; enabled: !!app.selectedWindow && !app.busy; onClicked: app.beginSwap() }
                                 OButton { palette: app.palette; text: 'Move window  M'; visible: app.view === 'windows'; enabled: !!app.selectedWindow && !app.busy; primary: true; onClicked: app.beginMove('window') }
                             }
@@ -449,8 +488,8 @@ ShellRoot {
                     MouseArea { anchors.fill: parent; onClicked: keyboard.forceActiveFocus() }
                     ColumnLayout {
                         anchors.centerIn: parent; width: Math.min(790, parent.width - SystemStyle.space(80)); spacing: SystemStyle.space(20)
-                        OLabel { palette: app.palette; text: app.dialog === 'window' ? 'Move window to…' : app.dialog === 'workspace' ? 'Move workspace ' + app.workspaceSource + ' to…' : app.dialog === 'swap' ? 'Swap window positions' : 'Bring your session back.'; font.pixelSize: SystemStyle.font.displayLarge; Layout.fillWidth: true }
-                        OLabel { palette: app.palette; text: app.dialog === 'workspace' ? 'An occupied destination swaps places. Both layouts stay together.' : app.dialog === 'restore' ? 'Reopen saved apps and restore their workspaces and layout.\nExisting windows are reused; extra tiled windows move to an unused workspace.' : app.dialog === 'swap' ? 'Choose the window whose position you want.' : 'Choose a workspace. Your window moves without switching your view.'; font.pixelSize: SystemStyle.font.body; opacity: .6; wrapMode: Text.Wrap; Layout.fillWidth: true }
+                        OLabel { palette: app.palette; text: app.dialog === 'window' ? 'Move window to…' : app.dialog === 'workspace' ? 'Move workspace ' + app.workspaceSource + ' to…' : app.dialog === 'swap' ? 'Swap window positions' : 'Restore ' + app.profileName; font.pixelSize: SystemStyle.font.displayLarge; Layout.fillWidth: true }
+                        OLabel { palette: app.palette; text: app.dialog === 'workspace' ? 'An occupied destination swaps places. Both layouts stay together.' : app.dialog === 'restore' ? 'Restore the saved layout for ' + app.profileName + '.\nExisting windows are reused; extra tiled windows move to an unused workspace.' : app.dialog === 'swap' ? 'Choose the window whose position you want.' : 'Choose a workspace. Your window moves without switching your view.'; font.pixelSize: SystemStyle.font.body; opacity: .6; wrapMode: Text.Wrap; Layout.fillWidth: true }
                         GridLayout {
                             visible: app.dialog === 'window' || app.dialog === 'workspace'; columns: 5; columnSpacing: 10; rowSpacing: 10; Layout.fillWidth: true
                             Repeater {
@@ -481,15 +520,15 @@ ShellRoot {
                         }
                         ColumnLayout {
                             visible: app.dialog === 'restore'; Layout.fillWidth: true; spacing: SystemStyle.space(12)
-                            OLabel { palette: app.palette; text: app.data.savedCount + ' saved windows · ' + (app.data.savedAt ? new Date(app.data.savedAt * 1000).toLocaleString() : 'Save a session first'); font.pixelSize: SystemStyle.font.title; color: app.palette.accent }
-                            OLabel { palette: app.palette; text: 'Apps restore their own tabs and documents. Terminals reopen as fresh shells.\nUnsupported launchers and layout limitations appear in the result.'; font.pixelSize: SystemStyle.font.bodySmall; opacity: .55; wrapMode: Text.Wrap; Layout.fillWidth: true }
-                            OButton { palette: app.palette; text: 'Restore last manual save  P'; enabled: !app.busy; onClicked: { app.dialog = ''; app.execute(['restore-pinned']) } }
+                            OLabel { palette: app.palette; text: 'Latest layout · ' + app.data.savedCount + ' windows · ' + (app.data.savedAt ? new Date(app.data.savedAt * 1000).toLocaleString() : 'Save a session first'); font.pixelSize: SystemStyle.font.title; color: app.palette.accent }
+                            OLabel { palette: app.palette; text: 'Window sizes save automatically after resizing settles. S saves immediately.\nThe manual checkpoint keeps the layout from the last time you pressed S.\nApps restore their own tabs and documents; terminals reopen as fresh shells.'; font.pixelSize: SystemStyle.font.bodySmall; opacity: .55; wrapMode: Text.Wrap; Layout.fillWidth: true }
+                            OButton { palette: app.palette; text: 'Manual checkpoint  P · ' + (app.data.pinnedAt ? new Date(app.data.pinnedAt * 1000).toLocaleString() : 'Not saved'); enabled: !app.busy && !!app.data.pinnedAt; onClicked: { app.dialog = ''; app.execute(['restore-pinned']) } }
                         }
                         RowLayout {
                             Layout.fillWidth: true
                             OLabel { palette: app.palette; text: app.dialog === 'restore' ? 'Placement changes apply immediately.' : 'Number keys or arrows to select'; font.pixelSize: SystemStyle.font.bodySmall; opacity: .45; Layout.fillWidth: true }
                             OButton { palette: app.palette; text: 'Cancel  Esc'; onClicked: app.dialog = '' }
-                            OButton { palette: app.palette; text: app.dialog === 'restore' ? 'Restore session  ↵' : app.dialog === 'swap' ? 'Swap positions  ↵' : 'Move / swap  ↵'; primary: true; enabled: !app.busy && (app.dialog !== 'restore' || !!app.data.savedAt); onClicked: app.acceptDialog() }
+                            OButton { palette: app.palette; text: app.dialog === 'restore' ? 'Restore latest  ↵' : app.dialog === 'swap' ? 'Swap positions  ↵' : 'Move / swap  ↵'; primary: true; enabled: !app.busy && (app.dialog !== 'restore' || !!app.data.savedAt); onClicked: app.acceptDialog() }
                         }
                     }
                 }

@@ -9,7 +9,63 @@ import time
 
 from .core import (CONFIG, ROOT, STATE, Hypr, atomic_json, lock, move_window,
                    move_workspace, read_json, restore_session, run, save_session,
-                   settings, state, swap_windows)
+                   settings, state, swap_windows, connected_monitors, display_profile,
+                   profile_directory, migrate_profiles)
+
+
+class ProfileWatcher:
+    """Debounce hotplug separately from ordinary changes to window geometry."""
+    def __init__(self, active):
+        self.active = active
+        self.candidate = active
+        self.since = time.monotonic()
+
+    def observe(self, key, now):
+        if key != self.candidate:
+            self.candidate, self.since = key, now
+        if key != self.active:
+            if now - self.since < 5:
+                return 'settling'
+            self.active = key
+            return 'changed'
+        return 'ready'
+
+
+class CheckpointTracker:
+    """Save size/state adjustments promptly, while letting app startup settle."""
+    def __init__(self, clients=()):
+        self.last = self.signature(clients) if clients else None
+        self.candidate = None
+        self.since = 0
+
+    @staticmethod
+    def signature(clients):
+        windows = sorted((c for c in clients if c['workspace']['id'] > 0 and c.get('mapped', True)),
+                         key=lambda c: c['address'])
+        structure = tuple((c['address'], c['workspace']['id'], c.get('monitor')) for c in windows)
+        geometry = [(c['at'], c['size'], c.get('floating', False),
+                     c.get('fullscreen', 0), c.get('fullscreenClient', 0)) for c in windows]
+        return structure, hashlib.sha256(json.dumps(geometry).encode()).hexdigest()
+
+    def ready(self, clients, now):
+        signature = self.signature(clients)
+        if signature != self.candidate:
+            self.candidate, self.since = signature, now
+        delay = 2 if self.last and self.last[0] == signature[0] else 15
+        return signature != self.last and now - self.since >= delay
+
+    def saved(self):
+        self.last = self.candidate
+
+
+def restore_detected(h, monitors):
+    directory = profile_directory(monitors)
+    if monitors and (directory / 'session.json').exists():
+        try:
+            restore_session(h, expected_profile=display_profile(monitors)['id'])
+        except Exception as e:
+            atomic_json(directory / 'restore-incomplete.json', {'message': str(e)})
+            atomic_json(directory / 'restore-report.json', {'message': str(e), 'failed': [str(e)], 'at': time.time()})
 
 
 def daemon(no_restore=False):
@@ -21,6 +77,8 @@ def daemon(no_restore=False):
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
     with lock('daemon'):
+        with lock():
+            migrate_profiles()
         session = os.environ.get('HYPRLAND_INSTANCE_SIGNATURE', '')
         if not session:
             raise RuntimeError('Start OmaSpace from the Hyprland session.')
@@ -32,33 +90,34 @@ def daemon(no_restore=False):
                 if stopped:
                     return
                 time.sleep(1)
-            if settings().get('autoRestore', True) and (STATE / 'session.json').exists():
-                try:
-                    with lock():
-                        restore_session()
-                except Exception as e:
-                    atomic_json(STATE / 'restore-report.json', {'message': str(e), 'failed': [str(e)], 'at': time.time()})
+            if settings().get('autoRestore', True):
+                with lock():
+                    h = Hypr()
+                    restore_detected(h, connected_monitors(h.query('monitors')))
         atomic_json(stamp, {'signature': session})
-        last_digest, candidate, stable_since = '', '', time.monotonic()
+        monitors = connected_monitors(Hypr().query('monitors'))
+        watcher = ProfileWatcher(display_profile(monitors)['id'])
+        checkpoint = CheckpointTracker(read_json(profile_directory(monitors) / 'session.json', {}).get('clients', []))
         while not stopped:
             try:
-                if settings().get('autosave', True) and not (STATE / 'restore-incomplete.json').exists():
-                    h = Hypr()
-                    clients = h.query('clients')
-                    signature = [(c['address'], c['workspace']['id'], c['at'], c['size'], c['floating'])
-                                 for c in clients if c['workspace']['id'] > 0]
-                    digest = hashlib.sha256(json.dumps(signature, sort_keys=True).encode()).hexdigest()
-                    if digest != candidate:
-                        candidate, stable_since = digest, time.monotonic()
-                    if digest != last_digest and time.monotonic() - stable_since >= 15:
+                h = Hypr()
+                monitors = connected_monitors(h.query('monitors'))
+                key = display_profile(monitors)['id']
+                transition = watcher.observe(key, time.monotonic())
+                if transition != 'ready':
+                    checkpoint = CheckpointTracker(read_json(profile_directory(monitors) / 'session.json', {}).get('clients', []))
+                    if transition == 'changed' and not no_restore and settings().get('autoProfileRestore', True):
                         with lock():
-                            save_session(h, automatic=True)
-                        last_digest = digest
+                            restore_detected(h, monitors)
+                elif monitors and settings().get('autosave', True) and not (profile_directory(monitors) / 'restore-incomplete.json').exists():
+                    clients = [c for c in h.query('clients') if c.get('monitor') in {m['id'] for m in monitors}]
+                    if checkpoint.ready(clients, time.monotonic()):
+                        with lock():
+                            save_session(h, automatic=True, expected_profile=key)
+                        checkpoint.saved()
             except Exception as e:
                 print(f'OmaSpace checkpoint: {e}', file=sys.stderr, flush=True)
-            for _ in range(5):
-                if stopped:
-                    return
+            if not stopped:
                 time.sleep(1)
 
 
@@ -89,9 +148,9 @@ def main():
             with lock():
                 cmd, a = opts.command, opts.args
                 if cmd == 'save':
-                    result = save_session()
+                    result = save_session(expected_profile=a[0] if a else None)
                 elif cmd in ('restore', 'restore-pinned'):
-                    result = restore_session(pinned=cmd == 'restore-pinned')
+                    result = restore_session(pinned=cmd == 'restore-pinned', expected_profile=a[0] if a else None)
                 elif cmd == 'move-window':
                     result = move_window(*a)
                 elif cmd == 'move-workspace':
@@ -108,8 +167,8 @@ def main():
                         Hypr().dispatch('focus', {'workspace': a[0]})
                     result = {'message': 'Workspace focused.'}
                 elif cmd == 'settings':
-                    if len(a) != 2 or a[0] not in ('autoRestore', 'autosave') or a[1] not in ('true', 'false'):
-                        raise ValueError('Usage: omaspace settings autoRestore|autosave true|false')
+                    if len(a) != 2 or a[0] not in ('autoRestore', 'autoProfileRestore', 'autosave') or a[1] not in ('true', 'false'):
+                        raise ValueError('Usage: omaspace settings autoRestore|autoProfileRestore|autosave true|false')
                     cfg = settings()
                     cfg[a[0]] = a[1] == 'true'
                     atomic_json(CONFIG / 'settings.json', cfg)

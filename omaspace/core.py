@@ -3,6 +3,7 @@ from __future__ import annotations
 import configparser
 import contextlib
 import fcntl
+import hashlib
 import json
 import math
 import os
@@ -181,24 +182,91 @@ def theme():
             'font': font}
 
 
+def sunshine_connected():
+    """Read connection events from the running service, never old boot logs."""
+    for unit in ('app-dev.lizardbyte.app.Sunshine.service', 'sunshine.service'):
+        try:
+            properties = dict(line.split('=', 1) for line in run(
+                ['systemctl', '--user', 'show', unit, '-p', 'ActiveState', '-p', 'InvocationID'], timeout=2).splitlines())
+            invocation = properties.get('InvocationID')
+            if properties.get('ActiveState') != 'active' or not invocation:
+                continue
+            events = run(['journalctl', '--user', '_SYSTEMD_INVOCATION_ID=' + invocation,
+                          '--no-pager', '-o', 'cat', '-g', 'CLIENT (DIS)?CONNECTED', '-n', '1'], timeout=2)
+            return 'CLIENT CONNECTED' in events
+        except (OSError, RuntimeError, subprocess.TimeoutExpired):
+            continue
+    return False
+
+
+def connected_monitors(monitors):
+    # Sunshine keeps its headless output even when Moonlight is disconnected.
+    modes = read_json(CONFIG / 'displays.json', {}).get('virtual', {'iPad': 'sunshine'})
+    streaming = sunshine_connected() if any(modes.get(m['name']) == 'sunshine' for m in monitors) else False
+    return [m for m in monitors if not m.get('disabled') and m.get('mirrorOf', 'none') in ('none', '', None)
+            and modes.get(m['name']) != 'off'
+            and (modes.get(m['name']) != 'sunshine' or streaming)]
+
+
+def display_profile(monitors):
+    names = sorted(m['name'] for m in monitors)
+    key = hashlib.sha256(json.dumps(names).encode()).hexdigest()[:16]
+    labels = ['Laptop' if n.startswith(('eDP', 'LVDS')) else n for n in names]
+    labels.sort(key=lambda n: (n != 'Laptop', n))
+    return {'id': key, 'name': ' + '.join(labels) or 'No displays', 'outputs': names}
+
+
+def profile_directory(monitors):
+    return STATE / 'profiles' / display_profile(monitors)['id']
+
+
+def migrate_profiles():
+    """Copy legacy saves by their recorded displays; keep the originals intact."""
+    marker = STATE / 'profiles-migrated.json'
+    if marker.exists():
+        return
+    for filename in ('session.json', 'pinned-session.json'):
+        saved = read_json(STATE / filename)
+        if not saved or not saved.get('monitors'):
+            continue
+        profile = display_profile(saved['monitors'])
+        directory = profile_directory(saved['monitors'])
+        if not (directory / filename).exists():
+            atomic_json(directory / filename, dict(saved, profile=profile))
+        if filename == 'pinned-session.json' and not (directory / 'session.json').exists():
+            atomic_json(directory / 'session.json', dict(saved, profile=profile))
+        atomic_json(directory / 'profile.json', profile)
+        if filename == 'session.json':
+            for name in ('restore-incomplete.json', 'restore-report.json'):
+                value = read_json(STATE / name)
+                if value is not None and not (directory / name).exists():
+                    atomic_json(directory / name, value)
+    atomic_json(marker, {'at': time.time()})
+
+
 def state(h=None, launchers=True):
     h = h or Hypr()
-    monitors = h.query('monitors')
+    all_monitors = h.query('monitors')
+    monitors = connected_monitors(all_monitors)
     workspaces = h.query('workspaces')
     clients = [c for c in h.query('clients') if c.get('mapped') and c['class'] != 'org.omaspace.test']
     rules = h.query('workspacerules')
     present = {w['id'] for w in workspaces}
-    # Include configured but uncreated workspaces, even with a disconnected monitor.
+    names = {m['name'] for m in monitors}
+    configured = {}
+    # Monitor rules are authoritative even when Hyprland has moved an empty
+    # persistent workspace onto a fallback display.
     for rule in rules:
         s = rule.get('workspaceString', '')
-        if s.isdigit() and int(s) not in present and rule.get('enabled', True):
-            workspaces.append({'id': int(s), 'name': s, 'monitor': rule.get('monitor', ''), 'windows': 0})
-            present.add(int(s))
-    for n in range(1, 11):
-        if n not in present:
-            default = monitors[0]['name'] if monitors else ''
-            workspaces.append({'id': n, 'name': str(n), 'monitor': default, 'windows': 0})
-    by_id = {m['id']: m for m in monitors}
+        if s.isdigit() and rule.get('enabled', True):
+            target = rule.get('monitor', '')
+            if target.startswith('desc:'):
+                target = next((m['name'] for m in monitors if m.get('description', '').startswith(target[5:])), target)
+            configured[int(s)] = target
+            if int(s) not in present and (not target or target in names):
+                workspaces.append({'id': int(s), 'name': s, 'monitor': target or (monitors[0]['name'] if monitors else ''), 'windows': 0})
+                present.add(int(s))
+    by_id = {m['id']: m for m in all_monitors}
     registry = DesktopRegistry() if launchers else None
     clients.sort(key=lambda c: (c['workspace']['id'], c['at'][0], c['at'][1], c['address']))
     for c in clients:
@@ -217,35 +285,69 @@ def state(h=None, launchers=True):
         w['connected'] = w.get('monitor') in {m['name'] for m in monitors}
         w['active'] = any(m['activeWorkspace']['id'] == w['id'] for m in monitors)
     workspaces.sort(key=lambda w: (w['id'] <= 0, w['id']))
-    saved = read_json(STATE / 'session.json', {})
-    return {'monitors': monitors, 'workspaces': workspaces, 'clients': clients,
+    primary, auxiliary = [], []
+    for w in workspaces:
+        target = configured.get(w['id'], w.get('monitor', ''))
+        if w['id'] > 0 and (w['id'] in configured and (not target or target in names)):
+            primary.append(w)
+        elif (w['id'] > 0 and w['id'] not in configured and w['connected'] and w['active']
+              and not any(not target or target == w.get('monitor') for target in configured.values())):
+            primary.append(w)
+        elif w['id'] > 0 and not configured and w['connected']:
+            primary.append(w)
+        elif w['clients']:
+            auxiliary.append(w)
+    profile = display_profile(monitors)
+    directory = profile_directory(monitors)
+    saved = read_json(directory / 'session.json', {})
+    pinned = read_json(directory / 'pinned-session.json', {})
+    profiles = [read_json(p) for p in sorted((STATE / 'profiles').glob('*/profile.json'))]
+    return {'monitors': monitors, 'workspaces': primary, 'auxiliaryWorkspaces': auxiliary, 'clients': clients,
+            'profile': profile, 'profiles': profiles, 'savePaused': (directory / 'restore-incomplete.json').exists(),
             'theme': theme(), 'savedAt': saved.get('savedAt'), 'savedCount': len(saved.get('clients', [])),
-            'autoRestore': settings().get('autoRestore', True), 'lastRestore': read_json(STATE / 'restore-report.json', {})}
+            'pinnedAt': pinned.get('savedAt'),
+            'autoRestore': settings().get('autoRestore', True),
+            'autoProfileRestore': settings().get('autoProfileRestore', True),
+            'lastRestore': read_json(directory / 'restore-report.json', {})}
 
 
 def settings():
     return read_json(CONFIG / 'settings.json', {'autoRestore': True, 'autosave': True})
 
 
-def save_session(h=None, automatic=False):
+def save_session(h=None, automatic=False, expected_profile=None):
+    h = h or Hypr()
+    migrate_profiles()
     s = state(h)
+    if not s['monitors']:
+        raise RuntimeError('No connected displays; keeping saved profiles.')
+    if expected_profile and s['profile']['id'] != expected_profile:
+        raise RuntimeError('Displays changed during save; keeping the previous profile.')
+    directory = profile_directory(s['monitors'])
+    if automatic and (directory / 'restore-incomplete.json').exists():
+        return {'message': 'Automatic saving paused for this display profile.'}
     # Scratchpads are owned by Omarchy's own preloader and excluded from reboot launch.
-    s['clients'] = [c for c in s['clients'] if c['workspace']['id'] > 0]
+    s['clients'] = [c for c in s['clients'] if c['workspace']['id'] > 0
+                    and c['monitor'] in {m['id'] for m in s['monitors']}]
+    s['workspaces'] += [w for w in s.pop('auxiliaryWorkspaces') if w['id'] > 0 and w['connected']]
     s.update(version=1, savedAt=time.time(), automatic=automatic)
-    old = read_json(STATE / 'session.json')
+    if display_profile(connected_monitors(h.query('monitors')))['id'] != s['profile']['id']:
+        raise RuntimeError('Displays changed during save; keeping the previous profile.')
+    old = read_json(directory / 'session.json')
     if automatic and not s['clients']:
         return {'message': 'Empty desktop: keeping the previous session.'}
     if old:
-        history = STATE / 'history'
+        history = directory / 'history'
         atomic_json(history / (str(time.time_ns()) + '.json'), old)
         for p in sorted(history.glob('*.json'))[:-20]:
             p.unlink()
-    atomic_json(STATE / 'session.json', s)
+    atomic_json(directory / 'profile.json', s['profile'])
+    atomic_json(directory / 'session.json', s)
     if not automatic:
-        atomic_json(STATE / 'pinned-session.json', s)
-        (STATE / 'restore-incomplete.json').unlink(missing_ok=True)
+        atomic_json(directory / 'pinned-session.json', s)
+        (directory / 'restore-incomplete.json').unlink(missing_ok=True)
     count = sum(bool(c.get('launcher')) for c in s['clients'])
-    return {'message': f'Saved {len(s["clients"])} windows · {count} can reopen automatically.'}
+    return {'message': f'Saved {s["profile"]["name"]}: {len(s["clients"])} windows · {count} can reopen automatically.'}
 
 
 def move_window(address, target, h=None):
@@ -387,17 +489,29 @@ def restore_layout(saved, matched, h):
     return bool(tree) or not tiled
 
 
-def restore_session(h=None, pinned=False):
+def restore_session(h=None, pinned=False, expected_profile=None):
     h = h or Hypr()
-    s = read_json(STATE / ('pinned-session.json' if pinned else 'session.json'))
+    migrate_profiles()
+    detected = connected_monitors(h.query('monitors'))
+    profile = display_profile(detected)
+    if not detected:
+        raise RuntimeError('No connected displays; keeping saved profiles.')
+    if expected_profile and profile['id'] != expected_profile:
+        raise RuntimeError('Displays changed before restore; try again after they settle.')
+    directory = profile_directory(detected)
+    def check_displays():
+        if display_profile(connected_monitors(h.query('monitors')))['id'] != profile['id']:
+            raise RuntimeError('Displays changed during restore; saved profile protected. Retry when connected.')
+    s = read_json(directory / ('pinned-session.json' if pinned else 'session.json'))
     if not s or s.get('version') != 1:
-        raise RuntimeError('No supported session saved yet. Press S to save this desktop.')
-    atomic_json(STATE / 'before-restore.json', state(h))
-    atomic_json(STATE / 'restore-incomplete.json', {'savedAt': s['savedAt']})
+        raise RuntimeError('No saved layout for these displays yet. Press S to save this profile.')
+    atomic_json(directory / 'before-restore.json', state(h))
+    atomic_json(directory / 'restore-incomplete.json', {'savedAt': s['savedAt']})
     saved = s['clients']
+    check_displays()
     matched, used, failed, skipped = {}, set(), [], []
     initial = h.query('clients')
-    original_monitors = h.query('monitors')
+    original_monitors = detected
     active = next((c['address'] for c in initial if c.get('focusHistoryID') == 0), None)
     def identity(c):
         return c.get('initialClass') or c['class']
@@ -417,6 +531,7 @@ def restore_session(h=None, pinned=False):
                     used.add(n['address'])
     match_existing(initial)
     for c in saved:
+        check_displays()
         if c['address'] in matched:
             continue
         # A previous launch may have restored several windows (for example Chrome).
@@ -442,6 +557,7 @@ def restore_session(h=None, pinned=False):
         h.evaluate('hl.exec_cmd(' + lua(shlex.join(argv)) + ', {workspace=' + lua(str(c['workspace']['id']) + ' silent') + '}); return "OMASPACE_OK"')
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline:
+            check_displays()
             candidates = [n for n in h.query('clients') if identity(n) == identity(c) and n['address'] not in used]
             if candidates:
                 n = next((n for n in candidates if n['title'] == c['title']), candidates[0])
@@ -451,12 +567,15 @@ def restore_session(h=None, pinned=False):
             time.sleep(.3)
         else:
             failed.append(c['class'] + ': no new window appeared')
-    monitors = h.query('monitors')
+    check_displays()
+    monitors = connected_monitors(h.query('monitors'))
     by_name = {m['name']: m for m in monitors}
     for ws in s['workspaces']:
+        check_displays()
         if ws['id'] > 0 and ws.get('monitor') in by_name and any(w['id'] == ws['id'] for w in h.query('workspaces')):
             h.dispatch('workspace.move', {'workspace': str(ws['id']), 'monitor': ws['monitor']})
     for c in saved:
+        check_displays()
         address = matched.get(c['address'])
         if not address:
             continue
@@ -478,6 +597,7 @@ def restore_session(h=None, pinned=False):
                         if r.get('workspaceString', '').isdigit())
     overflow = next(n for n in range(1, 2147483647) if n not in occupied_ids)
     for ws in s['workspaces']:
+        check_displays()
         group = [c for c in saved if c['workspace']['id'] == ws['id'] and c['address'] in matched]
         if not group:
             continue
@@ -495,7 +615,7 @@ def restore_session(h=None, pinned=False):
                 entry = {'address': c['address'], 'class': c['class'],
                          'from': ws['id'], 'to': overflow}
                 # Write recovery intent before changing the desktop.
-                atomic_json(STATE / 'restore-extra-windows.json',
+                atomic_json(directory / 'restore-extra-windows.json',
                             {'at': time.time(), 'windows': relocated + [entry]})
                 move_window(c['address'], str(overflow), h)
                 relocated.append(entry)
@@ -507,21 +627,22 @@ def restore_session(h=None, pinned=False):
         elif tiled:
             layout_warnings.append(f'Workspace {ws["id"]}: kept current layout (extra windows or another layout engine)')
     for c in saved:
-        if c['address'] in matched and c.get('fullscreen'):
+        if c['address'] in matched and (c.get('fullscreen') or c.get('fullscreenClient')):
             h.dispatch('window.fullscreen_state', {'window': 'address:' + matched[c['address']], 'internal': c['fullscreen'], 'client': c.get('fullscreenClient', 0)})
     # Restore the user's view after the placement work.
     for m in original_monitors:
         h.dispatch('focus', {'workspace': str(m['activeWorkspace']['id'])})
     if active and any(c['address'] == active for c in h.query('clients')):
         h.dispatch('focus', {'window': 'address:' + active})
-    result = {'message': f'Restored {len(matched)} of {len(saved)} windows.', 'failed': failed, 'skipped': skipped,
+    check_displays()
+    result = {'message': f'Restored {profile["name"]}: {len(matched)} of {len(saved)} windows.', 'failed': failed, 'skipped': skipped,
               'layoutWarnings': layout_warnings, 'relocated': relocated, 'at': time.time()}
     if relocated:
         noun = 'window' if len(relocated) == 1 else 'windows'
         result['message'] += f' Moved {len(relocated)} extra {noun} to workspace {overflow}.'
     if layout_warnings:
         result['message'] += ' Layout incomplete; automatic saving paused. Retry restore or save to accept this arrangement.'
-    atomic_json(STATE / 'restore-report.json', result)
+    atomic_json(directory / 'restore-report.json', result)
     if not failed and not skipped and not layout_warnings:
-        (STATE / 'restore-incomplete.json').unlink(missing_ok=True)
+        (directory / 'restore-incomplete.json').unlink(missing_ok=True)
     return result

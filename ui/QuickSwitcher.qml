@@ -7,7 +7,7 @@ Rectangle {
     required property var controller
     readonly property var palette: controller.palette
     readonly property var primary: controller.data.workspaces.filter(w => w.id >= 1 && w.id <= 10)
-    readonly property var extra: controller.data.workspaces.filter(w => w.id > 10 || w.id <= 0)
+    readonly property var extra: controller.data.workspaces.filter(w => w.id > 10).concat(controller.data.auxiliaryWorkspaces || [])
     readonly property var groups: {
         let names = []
         for (const w of primary) if (!names.includes(w.monitor)) names.push(w.monitor)
@@ -28,7 +28,7 @@ Rectangle {
         RowLayout {
             Layout.fillWidth: true
             OLabel { palette: quick.palette; text: 'Workspaces'; font.pixelSize: SystemStyle.font.heading }
-            OLabel { palette: quick.palette; text: 'OmaSpace'; font.pixelSize: SystemStyle.font.bodySmall; opacity: .35; Layout.leftMargin: SystemStyle.space(7) }
+            OLabel { palette: quick.palette; text: controller.profileName; font.pixelSize: SystemStyle.font.bodySmall; opacity: .35; Layout.leftMargin: SystemStyle.space(7) }
             Item { Layout.fillWidth: true }
             OButton { palette: quick.palette; text: 'Settings  ,'; onClicked: controller.showManager() }
             OButton { palette: quick.palette; text: 'Esc'; onClicked: controller.close() }
